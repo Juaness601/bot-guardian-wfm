@@ -82,6 +82,7 @@ async def healthcheck() -> dict[str, str]:
 async def start_bot() -> JSONResponse:
     """
     Inicia la tarea de monitoreo de Playwright en segundo plano sin bloquear el hilo HTTP.
+    Observa directamente la pantalla activa y continúa el ciclo sin pedir credenciales.
     """
     global monitoring_task
     async with task_lock:
@@ -98,15 +99,6 @@ async def start_bot() -> JSONResponse:
                 },
             )
 
-        if not config.DASHBOARD_URL:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content={
-                    "status": "idle",
-                    "error": "La variable de entorno WFM_DASHBOARD_URL es obligatoria para iniciar.",
-                },
-            )
-
         monitoring_task = asyncio.create_task(
             sentinel.run_monitoring_loop(),
             name="wfm_sentinel_loop",
@@ -117,7 +109,7 @@ async def start_bot() -> JSONResponse:
             status_code=status.HTTP_202_ACCEPTED,
             content={
                 "status": "running",
-                "message": "Monitoreo WFM iniciado en segundo plano para LOB COACH.",
+                "message": "Monitoreo WFM iniciado en segundo plano observando la pantalla activa.",
             },
         )
 

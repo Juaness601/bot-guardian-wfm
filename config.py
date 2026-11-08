@@ -1,6 +1,8 @@
 """
 Configuración centralizada para Bot Guardián (WFM Real-Time Sentinel) - LOB COACH.
 Responsable Técnico: Juan Esteban Serna Gutiérrez (Área WFM).
+Política Zero Credentials: El bot no solicita ni almacena credenciales de usuario;
+observa directamente el DOM de la pantalla activa de WFM y ejecuta el monitoreo.
 """
 
 import os
@@ -11,17 +13,16 @@ load_dotenv()
 
 
 class Config:
-    # --- Entorno del Servidor (Cloud Run) ---
+    # --- Entorno del Servidor (Cloud Run / Local) ---
     PORT: int = int(os.getenv("PORT", "8080"))
     HOST: str = os.getenv("HOST", "0.0.0.0")
     POLL_INTERVAL_SECONDS: int = int(os.getenv("POLL_INTERVAL_SECONDS", "15"))
     TIMEZONE_OFFSET_HOURS: int = int(os.getenv("TIMEZONE_OFFSET_HOURS", "-5"))  # Ej. America/Bogota (UTC-5)
 
-    # --- Credenciales y URLs (Variables de Entorno Estrictas) ---
+    # --- Conexión a Pantalla / Canal de Transmisión ---
+    # URL opcional de la vista en tiempo real (o conexión CDP a navegador ya abierto)
     DASHBOARD_URL: str = os.getenv("WFM_DASHBOARD_URL", "")
-    LOGIN_URL: str = os.getenv("WFM_LOGIN_URL", "")
-    WFM_USERNAME: str = os.getenv("WFM_USERNAME", "")
-    WFM_PASSWORD: str = os.getenv("WFM_PASSWORD", "")
+    BROWSER_CDP_URL: str = os.getenv("BROWSER_CDP_URL", "")
     GOOGLE_CHAT_WEBHOOK_URL: str = os.getenv("GOOGLE_CHAT_WEBHOOK_URL", "")
 
     # --- Umbrales de Alerta WFM (en segundos) ---
@@ -46,19 +47,13 @@ class Config:
         if s.strip()
     }
 
-    # --- Selectores CSS/XPath Parametrizados ---
-    # Selectores de Autenticación (opcionales si la sesión se inicia en la misma URL)
-    SELECTOR_USERNAME_INPUT: str = os.getenv("SELECTOR_USERNAME_INPUT", "input[name='username'], input[type='email'], #username")
-    SELECTOR_PASSWORD_INPUT: str = os.getenv("SELECTOR_PASSWORD_INPUT", "input[name='password'], input[type='password'], #password")
-    SELECTOR_LOGIN_BUTTON: str = os.getenv("SELECTOR_LOGIN_BUTTON", "button[type='submit'], #login-btn")
-
-    # Selectores de la Grilla/Tabla de Agentes en Tiempo Real
-    SELECTOR_AGENT_ROWS: str = os.getenv("SELECTOR_AGENT_ROWS", "table#agents-grid tbody tr, .agent-row")
+    # --- Selectores CSS/XPath Parametrizados de la Grilla en Pantalla ---
+    SELECTOR_AGENT_ROWS: str = os.getenv("SELECTOR_AGENT_ROWS", "table#agents-grid tbody tr, .agent-row, tbody tr")
     SELECTOR_AGENT_NAME: str = os.getenv("SELECTOR_AGENT_NAME", ".agent-name, td:nth-child(1)")
     SELECTOR_AGENT_STATE: str = os.getenv("SELECTOR_AGENT_STATE", ".agent-state, td:nth-child(2)")
     SELECTOR_AGENT_TIME: str = os.getenv("SELECTOR_AGENT_TIME", ".agent-time, td:nth-child(3)")
 
-    # --- Argumentos de Chromium para Contenedores Linux (Cloud Run) ---
+    # --- Argumentos de Chromium para Contenedores Linux (Cloud Run / Colab) ---
     CHROMIUM_ARGS: list[str] = [
         "--no-sandbox",
         "--disable-setuid-sandbox",

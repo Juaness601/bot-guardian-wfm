@@ -1,7 +1,8 @@
 """
 Módulo central de automatización y monitoreo con Playwright (Async API).
-Implementa extracción mínima del DOM, políticas Zero Data Retention, sin capturas
-multimedia, y deduplicación de alertas en memoria volátil.
+Opera bajo política Zero Credentials & Zero Data Retention:
+observa directamente la pantalla/DOM activo sin almacenar ni requerir contraseñas,
+sin capturas multimedia y con deduplicación en memoria volátil.
 """
 
 import asyncio
@@ -27,7 +28,7 @@ logger = logging.getLogger("bot_guardian.sentinel")
 class BotGuardian:
     """
     Orquestador de monitoreo WFM en tiempo real para la LOB COACH.
-    Opera 100% en memoria RAM (Zero Data Retention) y en modo Headless estricto.
+    Observa la pantalla/DOM activo y continúa el ciclo sin requerir credenciales.
     """
 
     def __init__(self) -> None:
@@ -36,6 +37,7 @@ class BotGuardian:
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._http_session: Optional[aiohttp.ClientSession] = None
+        self._attached_over_cdp: bool = False
 
         self._is_running: bool = False
         self._stop_event: asyncio.Event = asyncio.Event()
@@ -60,7 +62,6 @@ class BotGuardian:
             return None
 
         cleaned = raw_time.strip()
-        # Extraer patrón HH:MM:SS o MM:SS incluso si viene rodeado de texto adicional
         match = re.search(r"(\d{1,3}):(\d{2})(?::(\d{2}))?", cleaned)
         if not match:
             return None
@@ -98,18 +99,32 @@ class BotGuardian:
 
         return None
 
-    async def _init_browser(self) -> None:
+    async def _attach_or_launch_screen(self) -> None:
         """
-        Inicializa Playwright y Chromium en modo Headless estricto con banderas
-        optimizadas para contenedores Linux en Google Cloud Run.
+        Conecta el bot directamente a la pantalla activa sin usar credenciales:
+        1. Si BROWSER_CDP_URL está definido, se acopla a la ventana/pestaña ya abierta por el supervisor.
+        2. En caso contrario (Cloud Run / Colab), lanza Chromium Headless estricto y visualiza
+           directamente la pantalla activa para comenzar a leer la grilla.
         """
-        logger.info("Inicializando navegador Chromium en modo Headless estricto...")
         self._playwright = await async_playwright().start()
+
+        if config.BROWSER_CDP_URL:
+            logger.info("Acoplando Bot Guardián a la ventana activa del navegador vía CDP...")
+            self._browser = await self._playwright.chromium.connect_over_cdp(config.BROWSER_CDP_URL)
+            self._attached_over_cdp = True
+            contexts = self._browser.contexts
+            self._context = contexts[0] if contexts else await self._browser.new_context()
+            pages = self._context.pages
+            self._page = pages[0] if pages else await self._context.new_page()
+            logger.info("Pantalla activa detectada correctamente. Continuando monitoreo sobre la vista actual.")
+            return
+
+        logger.info("Inicializando navegador Chromium en modo Headless estricto...")
+        self._attached_over_cdp = False
         self._browser = await self._playwright.chromium.launch(
             headless=True,
             args=[arg.strip() for arg in config.CHROMIUM_ARGS if arg.strip()],
         )
-        # Contexto sin almacenamiento persistente ni grabación de video
         self._context = await self._browser.new_context(
             viewport={"width": 1280, "height": 720},
             ignore_https_errors=True,
@@ -117,82 +132,61 @@ class BotGuardian:
         )
         self._page = await self._context.new_page()
 
-        # Bloquear recursos multimedia pesados innecesarios para optimizar CPU/RAM en Cloud Run
+        # Bloquear recursos multimedia pesados innecesarios para optimizar CPU/RAM
         await self._page.route(
             "**/*.{png,jpg,jpeg,gif,webp,svg,mp4,webm,mp3,wav,woff,woff2,ttf}",
             lambda route: route.abort(),
         )
 
-    async def _authenticate_if_needed(self) -> None:
-        """
-        Navega a la URL de login/dashboard y ejecuta autenticación si las credenciales
-        están configuradas y el formulario de acceso está presente en el DOM.
-        """
-        if not self._page:
-            raise RuntimeError("La página de Playwright no ha sido inicializada.")
-
-        target_url = config.LOGIN_URL or config.DASHBOARD_URL
-        if not target_url:
-            raise ValueError("WFM_DASHBOARD_URL no está configurada en las variables de entorno.")
-
-        logger.info("Navegando al portal WFM...")
-        await self._page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
-
-        # Verificar si se requiere autenticación por formulario
-        if config.WFM_USERNAME and config.WFM_PASSWORD:
-            user_locator = self._page.locator(config.SELECTOR_USERNAME_INPUT).first
-            if await user_locator.count() > 0 and await user_locator.is_visible():
-                logger.info("Formulario de autenticación detectado. Iniciando sesión...")
-                await user_locator.fill(config.WFM_USERNAME)
-                await self._page.locator(config.SELECTOR_PASSWORD_INPUT).first.fill(
-                    config.WFM_PASSWORD
-                )
-                await self._page.locator(config.SELECTOR_LOGIN_BUTTON).first.click()
-                await self._page.wait_for_load_state("domcontentloaded", timeout=30000)
-
-        # Si existe una URL de dashboard distinta a la de login, navegar a ella
-        if config.LOGIN_URL and config.DASHBOARD_URL and self._page.url != config.DASHBOARD_URL:
-            await self._page.goto(
-                config.DASHBOARD_URL, wait_until="domcontentloaded", timeout=45000
-            )
+        if config.DASHBOARD_URL:
+            logger.info("Abriendo vista en tiempo real y esperando carga de pantalla...")
+            await self._page.goto(config.DASHBOARD_URL, wait_until="domcontentloaded", timeout=45000)
 
     async def _extract_agents_snapshot(self) -> list[dict[str, str]]:
         """
-        Realiza una extracción mínima del DOM leyendo únicamente:
+        Observa la pantalla activa del DOM y extrae únicamente:
         - Nombre o identificador del agente
         - Estado actual
         - Tiempo acumulado en ese estado
-        Prohibido extraer datos de clientes, transcripciones o tomar capturas.
+        Si hay varias pestañas abiertas en el contexto, inspecciona la que contenga la tabla de agentes.
         """
-        if not self._page:
+        if not self._context:
             return []
 
-        # Extracción ligera en un solo llamado evaluate_all para minimizar overhead IPC
-        rows_locator = self._page.locator(config.SELECTOR_AGENT_ROWS)
-        count = await rows_locator.count()
-        if count == 0:
-            return []
+        pages_to_check = list(self._context.pages) if self._context.pages else ([self._page] if self._page else [])
 
-        snapshot: list[dict[str, str]] = await rows_locator.evaluate_all(
-            """(rows, selectors) => {
-                return rows.map(row => {
-                    const nameEl = row.querySelector(selectors.name);
-                    const stateEl = row.querySelector(selectors.state);
-                    const timeEl = row.querySelector(selectors.time);
-                    return {
-                        agent_name: nameEl ? nameEl.innerText.trim() : "",
-                        state: stateEl ? stateEl.innerText.trim() : "",
-                        time_str: timeEl ? timeEl.innerText.trim() : ""
-                    };
-                }).filter(item => item.agent_name !== "" && item.state !== "");
-            }""",
-            {
-                "name": config.SELECTOR_AGENT_NAME,
-                "state": config.SELECTOR_AGENT_STATE,
-                "time": config.SELECTOR_AGENT_TIME,
-            },
-        )
-        return snapshot
+        for candidate_page in pages_to_check:
+            if candidate_page is None or candidate_page.is_closed():
+                continue
+
+            rows_locator = candidate_page.locator(config.SELECTOR_AGENT_ROWS)
+            count = await rows_locator.count()
+            if count == 0:
+                continue
+
+            snapshot: list[dict[str, str]] = await rows_locator.evaluate_all(
+                """(rows, selectors) => {
+                    return rows.map(row => {
+                        const nameEl = row.querySelector(selectors.name);
+                        const stateEl = row.querySelector(selectors.state);
+                        const timeEl = row.querySelector(selectors.time);
+                        return {
+                            agent_name: nameEl ? nameEl.innerText.trim() : "",
+                            state: stateEl ? stateEl.innerText.trim() : "",
+                            time_str: timeEl ? timeEl.innerText.trim() : ""
+                        };
+                    }).filter(item => item.agent_name !== "" && item.state !== "");
+                }""",
+                {
+                    "name": config.SELECTOR_AGENT_NAME,
+                    "state": config.SELECTOR_AGENT_STATE,
+                    "time": config.SELECTOR_AGENT_TIME,
+                },
+            )
+            if snapshot:
+                return snapshot
+
+        return []
 
     async def _process_agents(self, agents_data: list[dict[str, str]]) -> None:
         """
@@ -213,7 +207,6 @@ class BotGuardian:
             seen_agents_in_cycle.add(agent_name)
             state_key = f"{agent_name}_{normalized_state}"
 
-            # Verificar si el agente cambió de estado o reinició su cronómetro en el mismo estado
             previous_record = self._agent_last_state.get(agent_name)
             if previous_record is not None:
                 prev_state, prev_seconds = previous_record
@@ -222,21 +215,18 @@ class BotGuardian:
                 # Caso 1: Cambió de estado (ej. de 'Break' a 'Disponible' o 'En llamada')
                 if prev_state != normalized_state:
                     self._notified_keys.discard(prev_key)
-                # Caso 2: Mismo estado pero el contador se reinició (ej. nueva llamada tras colgar la anterior)
+                # Caso 2: Mismo estado pero el contador se reinició (ej. nueva llamada)
                 elif elapsed_seconds < prev_seconds:
                     self._notified_keys.discard(state_key)
 
-            # Actualizar el estado actual en memoria volátil
             self._agent_last_state[agent_name] = (normalized_state, elapsed_seconds)
 
-            # Evaluar si el estado aplica a una regla WFM (Long Call / Over Break / Over Lunch)
             rule = self.classify_alert_rule(raw_state)
             if rule is None:
                 continue
 
             event_type, threshold_seconds = rule
 
-            # Si supera el umbral y no ha sido notificado en este estado actual -> Disparar Alerta Única
             if elapsed_seconds > threshold_seconds and state_key not in self._notified_keys:
                 sent = await send_google_chat_alert(
                     agent_name=agent_name,
@@ -249,7 +239,6 @@ class BotGuardian:
                 if sent:
                     self._notified_keys.add(state_key)
 
-        # Limpiar agentes que ya no aparecen en el grid (desconectados) para evitar fugas de memoria
         disconnected_agents = set(self._agent_last_state.keys()) - seen_agents_in_cycle
         for absent_agent in disconnected_agents:
             prev_state, _ = self._agent_last_state.pop(absent_agent)
@@ -258,6 +247,7 @@ class BotGuardian:
     async def run_monitoring_loop(self) -> None:
         """
         Ciclo principal de monitoreo asíncrono ejecutado en segundo plano.
+        Observa la pantalla de la página y continúa monitoreando automáticamente.
         """
         if self._is_running:
             logger.warning("El ciclo de monitoreo ya se encuentra en ejecución.")
@@ -268,17 +258,19 @@ class BotGuardian:
         self._http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
 
         try:
-            await self._init_browser()
-            await self._authenticate_if_needed()
-            logger.info("Monitoreo WFM iniciado exitosamente para LOB COACH.")
+            await self._attach_or_launch_screen()
+            logger.info("Monitoreo WFM activo sobre la pantalla actual para LOB COACH.")
 
             while not self._stop_event.is_set():
                 try:
                     agents_snapshot = await self._extract_agents_snapshot()
-                    await self._process_agents(agents_snapshot)
+                    if agents_snapshot:
+                        await self._process_agents(agents_snapshot)
+                    else:
+                        logger.debug("Esperando que la tabla de agentes sea visible en la pantalla actual...")
                 except PlaywrightError as pw_err:
                     logger.warning(
-                        "Error transitorio de Playwright durante lectura del DOM (%s). Reintentando...",
+                        "Aviso transitorio al leer la pantalla (%s). Continuando ciclo...",
                         type(pw_err).__name__,
                     )
                 except Exception as loop_err:
@@ -287,7 +279,6 @@ class BotGuardian:
                         type(loop_err).__name__,
                     )
 
-                # Espera no bloqueante interrumpible de inmediato por /stop
                 try:
                     await asyncio.wait_for(
                         self._stop_event.wait(),
@@ -311,14 +302,12 @@ class BotGuardian:
 
     async def shutdown(self) -> None:
         """
-        Cierra de forma limpia y segura (graceful shutdown) la sesión HTTP,
-        la página, el contexto, el navegador Chromium y la instancia de Playwright.
-        Limpia además los registros en memoria RAM.
+        Cierra de forma limpia y segura (graceful shutdown) la sesión HTTP y Playwright.
+        Si estaba acoplado por CDP a la ventana del usuario, se desconecta sin cerrarle su ventana.
         """
         self._is_running = False
         self._stop_event.set()
 
-        # Limpiar estructuras en memoria volátil
         self._notified_keys.clear()
         self._agent_last_state.clear()
 
@@ -329,26 +318,26 @@ class BotGuardian:
                 pass
         self._http_session = None
 
-        if self._page:
-            try:
-                await self._page.close()
-            except Exception:
-                pass
-            self._page = None
+        if not self._attached_over_cdp:
+            if self._page:
+                try:
+                    await self._page.close()
+                except Exception:
+                    pass
+            if self._context:
+                try:
+                    await self._context.close()
+                except Exception:
+                    pass
+            if self._browser:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
 
-        if self._context:
-            try:
-                await self._context.close()
-            except Exception:
-                pass
-            self._context = None
-
-        if self._browser:
-            try:
-                await self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
+        self._page = None
+        self._context = None
+        self._browser = None
 
         if self._playwright:
             try:
